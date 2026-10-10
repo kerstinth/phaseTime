@@ -1,0 +1,38 @@
+Package: phaseTime
+Type: Package
+Title: Haplotype-Specific Phasing of Somatic Mutations and Copy Number Gain Timing
+Version: 0.1.0
+Authors@R:
+    person("Kerstin", "Thol", role = c("aut", "cre"),
+           email = "kerstinm.thol@gmail.com")
+Description: Combines long-read and short-read whole genome sequencing data to
+    phase somatic mutations to haplotypes and to estimate the haplotype-specific
+    evolutionary timing of somatic copy number gains. Mutations are phased to
+    heterozygous SNPs that are physically linked on long reads; SNPs are phased
+    to haplotypes using B-allele frequencies in regions of allelic imbalance
+    (optionally across several tumour regions); mutation multiplicities are then
+    used to classify mutations as early or late relative to a gain, to define
+    ancestral copy number states and to estimate the timing of first and
+    subsequent copy number gains, including gains placed on the edges of a
+    tumour phylogeny. Includes the simulation framework used to validate the
+    approach. Implements the methods described in Chapter 6 of K. Thol's PhD
+    thesis (University College London, 2024).
+License: MIT + file LICENSE
+Encoding: UTF-8
+Depends:
+    R (>= 4.1.0)
+Imports:
+    ggplot2 (>= 3.4.0),
+    patchwork,
+    stats,
+    utils
+Suggests:
+    knitr,
+    rmarkdown,
+    testthat (>= 3.0.0)
+VignetteBuilder: knitr
+Config/testthat/edition: 3
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.3
+URL: https://github.com/kerstinth/phaseTime
+BugReports: https://github.com/kerstinth/phaseTime/issues

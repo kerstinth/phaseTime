@@ -1,0 +1,494 @@
+---
+title: "phaseTime tutorial: haplotype-specific copy number gain timing"
+output:
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 2
+vignette: >
+  %\VignetteIndexEntry{phaseTime tutorial: haplotype-specific copy number gain timing}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", fig.align = "center",
+                      dpi = 96, out.width = "100%", message = FALSE, warning = FALSE)
+example_fig <- function(n) knitr::include_graphics(file.path("figures", sprintf("illustration_%02d.png", n)))
+```
+
+phaseTime combines long-read and short-read whole genome sequencing (WGS) of
+tumour samples to
+
+1. **phase somatic mutations to haplotypes**, using heterozygous SNPs that are on
+   the same long reads as the mutation, and
+2. **estimate the evolutionary timing of copy number gains, separately for each
+   haplotype**, including several consecutive gains of the same segment and gains
+   placed on the edges of a tumour phylogeny.
+
+This tutorial walks through every step of the method on a simulated tumour.
+Alongside the plots produced here, schematic illustrations explain the
+principles, and example output from real multi-region long-read sequenced lung
+tumours shows what the results look like on real data.
+
+```{r illustration-overview, echo = FALSE, fig.cap = "Principles of phasing mutations to haplotypes: mutations are physically linked to SNPs on long reads, SNPs are phased to haplotypes, and the mutation inherits the haplotype of its linked SNP alleles."}
+example_fig(3)
+```
+
+# Installation
+
+```{r install, eval = FALSE}
+# install.packages("remotes")
+remotes::install_github("kerstinth/phaseTime", build_vignettes = TRUE)
+```
+
+phaseTime only depends on `ggplot2` and `patchwork`.
+
+```{r load}
+library(phaseTime)
+library(ggplot2)
+```
+
+# Input data
+
+phaseTime takes the following inputs for each tumour region (*sample*):
+
+| input | columns | typical source |
+|---|---|---|
+| `mutations` | `sample`, `chr`, `pos`, `vaf` (or `var_count`, `depth`), optionally `cluster` | Mutect2 calls from paired short-read WGS |
+| `cn` | `sample`, `chr`, `seg_start`, `seg_end`, major / minor copy number | Battenberg on short-read WGS |
+| `purity` | named vector, one value per sample | Battenberg |
+| `snps` | `region`, `chr`, `pos`, `baf` of heterozygous germline SNPs | SNP calling / Battenberg allele counts |
+| `linkage` | `sample`, `chr`, `pos`, `snp_pos`, `mt_snp_alt`, `mt_snp_ref` | pileup of Nanopore long reads (Dorado, minimap2 to GRCh38) |
+| `tree` | edges (parent, child) and trunk | CONIPHER on short-read WGS |
+
+`linkage` contains, for every mutation and nearby heterozygous SNP, the number
+of long reads that carry the mutation **and** the alternative (`mt_snp_alt`) or
+reference (`mt_snp_ref`) allele of the SNP.
+
+To make this tutorial self-contained we simulate a tumour with two regions with
+`simulate_tumour()`. Mutations are acquired on individual DNA copies along the
+phylogeny `1 -> 2 -> 3` and `1 -> 4 -> 5` (cluster 2 is clonal in region 1,
+cluster 4 in region 2), and copy number gains duplicate DNA copies together with
+the mutations they carry. The simulated reads mimic a typical long-read study
+(~200x short-read and ~17x long-read coverage). Because the gain times are known,
+we can check the estimates against the truth.
+
+```{r simulate}
+sim <- simulate_tumour(seed = 1)
+names(sim)
+head(sim$mutations[, c("sample", "chr", "pos", "ref", "alt", "var_count", "depth", "vaf", "cluster")])
+head(sim$cn[, c("sample", "chr", "seg_start", "seg_end", "nMajor", "nMinor")])
+head(sim$snps[, c("region", "chr", "pos", "baf")])
+head(sim$linkage)
+sim$purity
+sim$tree
+```
+
+# Step 1: phasing mutations to SNPs
+
+Long reads can carry both a somatic mutation and a heterozygous SNP. Simulating
+random positions of 50,000 mutations and 2.25 million heterozygous SNPs shows
+how much longer reads increase the fraction of mutations that can be phased:
+about 10% with 150 bp reads, but almost all with 5 kb reads.
+
+```{r phasing-simulation, fig.width = 5, fig.height = 3.5, out.width = "55%"}
+phasing_sim <- simulate_snp_phasing(seed = 1)
+phasing_sim
+plot_snp_phasing_simulation(phasing_sim)
+```
+
+```{r illustration-4, echo = FALSE, fig.cap = "Example from real data: (A) a mutation and a heterozygous SNP on the same long reads; (B) the simulation above; (C-F) percentage of mutations phased to SNPs per tumour region and its relation to read length, coverage and number of heterozygous SNPs.", out.width = "75%"}
+example_fig(4)
+```
+
+To reduce run time, only the 16 SNPs closest to each mutation (within 20 kb)
+are considered. `select_phasing_snps()` creates this list of mutation-SNP pairs
+that is then counted in the long-read BAM file (e.g. with `samtools mpileup`),
+discarding loci with fewer than 3 reads, to produce the `linkage` table.
+
+```{r select-snps}
+r1_snps <- unique(sim$snps[sim$snps$region == "SIM001_R1", c("chr", "pos")])
+r1_muts <- sim$mutations[sim$mutations$sample == "SIM001_R1", ]
+pairs <- select_phasing_snps(r1_muts, r1_snps, max_snps = 16, max_distance = 20000)
+head(pairs)
+```
+
+# Step 2: phasing SNPs to haplotypes
+
+In a segment with allelic imbalance the B-allele frequency (BAF) of a
+heterozygous SNP deviates from 0.5. SNPs whose alternative allele is on the more
+abundant haplotype have BAF > 0.5; this haplotype is called **haplotype A**, the
+other **haplotype B**.
+
+With several tumour regions, a segment can be phased as long as *one* region is
+imbalanced: `phase_snps()` uses the region with the strongest allelic imbalance
+as the reference and applies its SNP haplotypes to all regions.
+
+```{r phase-snps}
+cn_long <- sim$cn
+cn_long$region <- cn_long$sample
+snps_phased <- phase_snps(sim$snps, cn = cn_long)
+head(snps_phased[, c("region", "chr", "pos", "baf", "ref_region", "single_region_haplotype", "haplotype")])
+```
+
+In region 1, chromosomes 11, 15 and 22 are balanced (BAF ~ 0.5) and cannot be
+phased from region 1 alone (top), but region 2 carries a gain there, so the
+multi-region haplotypes phase them (bottom).
+
+```{r plot-snps, fig.width = 13, fig.height = 6}
+plot_snp_haplotypes(snps_phased, region = "SIM001_R1")
+```
+
+```{r illustration-5, echo = FALSE, fig.cap = "Example from real data: single-region (top) and multi-region (bottom) SNP phasing of two regions of the same tumour."}
+example_fig(5)
+```
+
+# Step 3: haplotype copy number and mutation multiplicity
+
+Battenberg reports major and minor copy numbers. `haplotype_copy_number()`
+assigns them to haplotypes A and B using the phased SNPs, so that copy number
+and mutations refer to the same haplotypes in every region. For subclonal
+segments, `battenberg_average_cn()` averages the clone states by their cellular
+fractions (resulting in non-integer copy numbers).
+
+```{r hap-cn}
+cn_r1 <- haplotype_copy_number(sim$cn[sim$cn$sample == "SIM001_R1", ],
+                               snps = snps_phased[snps_phased$region == "SIM001_R1", ])
+head(cn_r1[, c("chr", "seg_start", "seg_end", "nMajor", "nMinor", "flip", "cnA", "cnB")])
+```
+
+Next, the mutation multiplicity (the number of DNA copies carrying a mutation)
+is computed from the VAF, the purity `p` and the total copy number `CN_t`
+(normal copy number `CN_n` = 2):
+
+$$n_{mut} = VAF \cdot \frac{1}{p} \left[p\,CN_t + CN_n (1 - p)\right]$$
+
+```{r annotate}
+muts_r1 <- annotate_mutations(sim$mutations[sim$mutations$sample == "SIM001_R1", ],
+                              cn_r1, purity = sim$purity[["SIM001_R1"]])
+head(muts_r1[, c("chr", "pos", "vaf", "cnA", "cnB", "tot_cn", "mut_cpn")])
+```
+
+# Step 4: phasing mutations to haplotypes
+
+For every SNP on the same long reads as a mutation, phaseTime computes the
+fraction of mutated reads that carry the SNP alternative allele. Using the SNP
+haplotype, this becomes the fraction of mutated reads on haplotype A (one minus
+the fraction for SNPs whose alternative allele is on haplotype B). The mean
+across SNPs decides the haplotype of the mutation: A if >= 0.5, otherwise B.
+
+```{r illustration-6, echo = FALSE, fig.cap = "Phasing mutations using the haplotypes of physically linked SNPs.", out.width = "65%"}
+example_fig(6)
+```
+
+```{r phase-muts}
+phased_r1 <- phase_mutations(sim$linkage[sim$linkage$sample == "SIM001_R1", ], snps_phased, muts_r1)
+table(phase = phased_r1$phase, useNA = "ifany")
+```
+
+In regions of loss of heterozygosity one haplotype has copy number 0, so any
+mutation phased to it must be wrong. `phasing_summary()` uses this to estimate
+the phasing error:
+
+```{r phasing-summary}
+phasing_summary(phased_r1)
+```
+
+The simulation also records the true haplotype, which confirms the accuracy:
+
+```{r phasing-accuracy}
+with(phased_r1[!is.na(phased_r1$phase), ], mean(phase == true_phase))
+```
+
+`plot_phased_mutations()` shows five views of a tumour region: copy number
+only, all mutations, mutations coloured by haplotype, and haplotype A or B
+mutations only.
+
+```{r plot-phased, fig.width = 13, fig.height = 13}
+p_types <- c("copy_number", "all", "haplotype", "A", "B")
+patchwork::wrap_plots(lapply(p_types, function(t) plot_phased_mutations(phased_r1, cn_r1, type = t)),
+                      ncol = 1) + patchwork::plot_annotation(tag_levels = "A")
+```
+
+```{r illustration-8, echo = FALSE, fig.cap = "Example from real data: the same five views (A-E) for a lung tumour region."}
+example_fig(8)
+```
+
+All plots also work for single chromosomes:
+
+```{r plot-phased-chr, fig.width = 9, fig.height = 3}
+plot_phased_mutations(phased_r1, cn_r1, type = "haplotype", chr = "chr14")
+```
+
+# Step 5: early and late mutations
+
+On a gained segment, a mutation acquired **before** the gain was copied with the
+segment, so its multiplicity equals the haplotype copy number (**early**). A
+mutation acquired **after** the gain is only on some copies (**late**).
+`classify_mutation_timing()` rounds multiplicities and compares them with the
+copy number of the haplotype the mutation is on. Only clonal (integer) gained
+haplotypes can be timed.
+
+```{r classify}
+phased_r1 <- classify_mutation_timing(phased_r1)
+table(phased_r1$timing)
+```
+
+```{r plot-timing, fig.width = 9, fig.height = 9}
+(plot_mutation_timing(phased_r1, chr = "chr5", colour_by = "haplotype") + ggtitle("A-C")) /
+  (plot_mutation_timing(phased_r1, chr = "chr5", haplotypes = "A") + ggtitle("D"))
+```
+
+```{r illustration-9, echo = FALSE, fig.cap = "Example from real data: mutations on one chromosome by haplotype (A-C) and early (orange) / late (purple) mutations on haplotype A (D).", out.width = "70%"}
+example_fig(9)
+```
+
+Note how separating the haplotypes matters: without phasing, the haplotype B
+mutations at multiplicity 1 would be counted as *late* mutations of the
+haplotype A gain, making the gain appear earlier than it was.
+
+# Step 6: ancestral copy number states
+
+On segments with several consecutive gains, multiplicities cluster at integer
+values below the observed copy number. Each such cluster marks an *ancestral*
+copy number state that existed before a later gain. `assign_cn_states()`
+assigns mutations to the closest integer state and removes states supported by
+fewer than 5 mutations.
+
+On chromosome 5 the simulated haplotype A was gained twice (1 -> 2 -> 3), and
+the mutations form three states:
+
+```{r cn-states, fig.width = 9, fig.height = 3.2}
+phased_r1 <- assign_cn_states(phased_r1, min_muts = 5)
+table(state = phased_r1$cn_state[phased_r1$chr == "chr5" & phased_r1$phase %in% "A"])
+plot_cn_states(phased_r1, haplotype = "A", chr = "chr5")
+```
+
+```{r illustration-10, echo = FALSE, fig.cap = "Ancestral copy number states: (A, B) a gain history that results in mutations at multiplicities 1, 2 and 3 on a segment with copy number 3; (C) an example from real data.", out.width = "75%"}
+example_fig(10)
+```
+
+# Step 7: timing copy number gains
+
+The relative numbers of early and late mutations tell us when a gain occurred:
+few early mutations mean an early gain, many a late one.
+
+```{r illustration-11, echo = FALSE, fig.cap = "Principles of timing copy number gains."}
+example_fig(11)
+```
+
+Because more DNA copies accumulate more mutations, each mutation count is divided
+by the number of copies present when the mutations were acquired. The timing of
+a gain is then the copy number adjusted number of mutations acquired before the
+gain, divided by all adjusted mutations. A value of 0 means the gain happened at
+the start of tumour evolution and 1 means it happened at the time of sampling.
+The 95% confidence interval is \(T \pm 1.96\sqrt{T(1-T)/N}\).
+
+The worked example below (one mutation before the first gain, two
+between the gains, three after the second gain) gives timings of 1/3 and 2/3:
+
+```{r worked-example}
+gain_timing_from_counts(states = c(3, 2, 1), counts = c(1, 2, 3))
+```
+
+```{r illustration-13, echo = FALSE, fig.cap = "Estimating the timing of first and subsequent gains: late mutations are divided by the number of copies present when they occurred."}
+example_fig(13)
+```
+
+# Step 8: validating the timing by simulation
+
+`simulate_gain_history()` follows a DNA segment over 10,000 cell divisions.
+Mutations are drawn from a Poisson distribution whose rate is proportional to
+the current copy number, and gains happen after specified numbers of divisions,
+so the true timing of each gain is known.
+
+```{r sim-scenarios, fig.width = 10, fig.height = 3.5}
+set.seed(11)
+scenario_a <- simulate_gain_history(timepoints = c(7000, 8000, 10000), cn_steps = c(1, 3, 10, 10))
+plot_simulated_gain_timing(scenario_a)
+scenario_b <- simulate_gain_history(timepoints = c(1000, 2000, 5000, 10000), cn_steps = c(1, 2, 3, 5, 5))
+simulated_gain_timing(scenario_b)[, c("gain_index", "copy_number_before_gain", "copy_number_after_gain",
+                                      "gain_timing", "loCI", "hiCI", "theoretical_gain_timing")]
+plot_simulated_gain_timing(scenario_b)
+```
+
+Repeating this for 1,000 random scenarios (1 to 5 gains, copy numbers up to
+10) at three mutation rates shows that the estimates are accurate (median
+absolute error < 0.01 at 1.33e-8 per bp) but become very uncertain at low
+mutation rates:
+
+```{r sim-accuracy, fig.width = 12, fig.height = 3.5}
+acc <- simulate_gain_timing_accuracy(n_sim = 1000, seed = 1)
+tapply(acc$abs_difference, acc$mutation_rate_bp, median)
+tapply(acc$ci_width, acc$mutation_rate_bp, median)
+plot_gain_timing_accuracy(acc)
+```
+
+```{r illustration-14, echo = FALSE, fig.cap = "Reference results of the same simulations: example scenarios (A-C, E-G), absolute error (D) and confidence interval widths (H)."}
+example_fig(14)
+```
+
+# Step 9: timing clonal gains across the genome
+
+`time_gains()` brings everything together. For every clonal gained segment and
+each haplotype it
+
+1. assigns phased mutations to copy number states (per mutation cluster),
+2. reconstructs the copy number path of the segment from the states,
+3. times every gain between consecutive states, and
+4. when a tree is given, keeps a gain of an ancestral cluster only if the same
+   gain is not also seen in a descendant cluster, where it actually happened.
+
+To time clonal gains, only the mutations of the trunk cluster are used:
+
+```{r time-gains}
+timing_r1 <- time_gains(phased_r1, cluster_col = "cluster", tree = sim$tree, sample = "SIM001_R1")
+head(timing_r1[, c("segID", "haplotype", "cluster", "gain_index", "copy_number_before_gain",
+                   "copy_number_after_gain", "n_mutations", "gain_timing", "loCI", "hiCI")])
+```
+
+`plot_gain_timing()` produces a genome-wide summary: copy
+number; haplotype A mutations (yellow: before the first gain, blue: after the
+first gain, grey: not timed); haplotype A gain timing with 95% confidence
+intervals; and the same for haplotype B.
+
+```{r plot-gain-timing, fig.width = 13, fig.height = 11}
+plot_gain_timing(timing_r1, phased_r1, cn_r1, title = "SIM001 region 1")
+```
+
+```{r illustration-15, echo = FALSE, fig.cap = "Example from real data: gain timing output for a lung tumour region."}
+example_fig(15)
+```
+
+Since this is simulated data, the estimates can be compared with the true gain
+times:
+
+```{r truth, fig.width = 4.5, fig.height = 4, out.width = "50%"}
+key <- function(d) paste(d$segID, d$haplotype, d$cluster, d$copy_number_before_gain, d$copy_number_after_gain)
+timing_r1$truth <- sim$truth$true_timing[match(key(timing_r1), key(sim$truth))]
+ggplot(timing_r1[!is.na(timing_r1$truth), ], aes(truth, gain_timing, colour = factor(gain_index))) +
+  geom_abline(linetype = 2, colour = "grey50") +
+  geom_errorbar(aes(ymin = loCI, ymax = hiCI), width = 0) + geom_point() +
+  scale_colour_manual(name = "gain", values = gain_colours(4)[c(2, 4, 6)]) +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  labs(x = "simulated gain timing", y = "phaseTime estimate") + theme_bw()
+```
+
+First gains are recovered accurately. Second gains of the form 2 -> 3 are
+estimated somewhat too early in this simulation: here the gain duplicates only
+one of the two copies, so only half of the mutations acquired between the two
+gains reach the higher multiplicity.
+
+## Multi-region analysis
+
+`run_phaseTime()` runs all steps above for every region at once, including the
+multi-region SNP phasing:
+
+```{r run-all}
+res <- run_phaseTime(sim$mutations, sim$cn, sim$purity, sim$snps, sim$linkage,
+                     cluster_col = "cluster", tree = sim$tree)
+names(res)
+res$phasing
+```
+
+The first clonal gains of all regions can be summarised as a heatmap, and
+gains timed independently in two regions of the same tumour can be compared:
+
+```{r heatmap, fig.width = 13, fig.height = 3.5}
+plot_timing_heatmap(res$timing)
+```
+
+```{r compare, fig.width = 8, fig.height = 3}
+comparison <- compare_region_timing(res$timing)
+median(comparison$difference)
+plot_region_comparison(comparison)
+```
+
+```{r illustration-16, echo = FALSE, fig.cap = "Example from real data: first clonal gain timing across ten regions of lung tumours (A) and concordance between regions of the same tumour (B, C)."}
+example_fig(16)
+```
+
+# Step 10: placing gains on the phylogenetic tree
+
+With mutation clusters and a phylogenetic tree, gains can be timed within the
+subclonal expansion in which they happened. Use
+`clonal_only = FALSE` to also return gains of subclonal clusters.
+
+In the simulated tumour, haplotype A of chromosome 14 was gained in the trunk
+(1 -> 2 copies) after 44% of the trunk's evolutionary time, and doubled again
+(2 -> 4 copies) in cluster 2 after 30% of cluster 2's evolutionary time, while
+haplotype B was lost. The trunk
+mutations sit at multiplicity 4 (before the trunk gain) or 2 (after), and the
+cluster 2 mutations at 2 (before the cluster 2 doubling) or 1 (after):
+
+```{r cluster-plot, fig.width = 6, fig.height = 7, out.width = "60%"}
+plot_cluster_segment(phased_r1, "chr14_1_107043718", haplotype = "A", clusters = c("1", "2"))
+```
+
+```{r tree-timing, fig.width = 5, fig.height = 5, out.width = "50%"}
+timing_tree <- time_gains(phased_r1, cluster_col = "cluster", tree = sim$tree, clonal_only = FALSE)
+timing_tree[timing_tree$segID == "chr14_1_107043718",
+            c("haplotype", "cluster", "copy_number_before_gain", "copy_number_after_gain", "gain_timing")]
+sim$truth[sim$truth$segID == "chr14_1_107043718", ]
+plot_timing_tree(sim$tree, timing_tree, "chr14_1_107043718", haplotype = "A")
+```
+
+```{r illustration-17, echo = FALSE, fig.cap = "Example from real data: two gains of the same segment, one in the trunk and one in a subclone, placed on the tumour phylogeny."}
+example_fig(17)
+```
+
+Gains seen only in region 2 (cluster 4) are placed on the edge leading to
+cluster 4:
+
+```{r tree-r2}
+m2 <- res$mutations[res$mutations$sample == "SIM001_R2", ]
+t2 <- time_gains(m2, cluster_col = "cluster", tree = sim$tree, clonal_only = FALSE, sample = "SIM001_R2")
+t2[t2$cluster == "4", c("segID", "haplotype", "copy_number_before_gain", "copy_number_after_gain", "gain_timing")]
+sim$truth[sim$truth$cluster == "4", ]
+```
+
+# Using your own data
+
+A typical analysis of Battenberg / CONIPHER output looks like this:
+
+```{r real-data, eval = FALSE}
+# copy number: average subclonal states, keep a sample column
+cn <- do.call(rbind, lapply(regions, function(r) {
+  bb <- read.table(paste0(r, "_subclones.txt"), header = TRUE)
+  cbind(sample = r, battenberg_average_cn(bb))
+}))
+
+# alternatively use Battenberg's multi-region haplotypes directly:
+# flips <- parse_battenberg_msai(read.table("multisample_MSAI.txt", header = TRUE))
+# cn_r1 <- haplotype_copy_number(cn[cn$sample == "R1", ], flip = flips[flips$region == "R1", ])
+
+purity <- c(R1 = 0.62, R2 = 0.48)
+tree <- as_phaseTime_tree(readRDS("tumour.tree.RDS"))  # CONIPHER tree object
+
+res <- run_phaseTime(mutations, cn, purity, snps, linkage,
+                     cluster_col = "cluster", tree = tree, output_dir = "phaseTime_output")
+```
+
+# Notes on the implementation
+
+* **Count adjustment.** By default (`adjust = "copies_present"`) mutation counts
+  are divided by the number of copies present while the mutations were acquired,
+  as described above and validated by the simulations. An alternative is to
+  divide the counts by the multiplicity of each state; use `adjust = "multiplicity"` in `time_gains()` or
+  `gain_timing_from_counts()` for this.
+* **Minimum mutations per state.** States with fewer than `min_muts = 5`
+  mutations are removed. With low sequencing depth, noisy multiplicities can
+  create spurious intermediate states; increase `min_muts` in that case.
+* **Detection of late mutations in amplifications.** At high copy number,
+  mutations on a single copy have a low VAF and may be missed by mutation
+  callers, so the timing of highly amplified segments may be biased towards late
+  gains. `detection_limit_cn()` gives the copy number above which a single copy
+  mutation falls below a given VAF:
+
+```{r detection}
+detection_limit_cn(purity = c(0.3, 0.5, 0.7, 0.9), min_vaf = 0.05)
+```
+
+```{r session}
+sessionInfo()
+```

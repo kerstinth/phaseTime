@@ -1,0 +1,6 @@
+^.*\.Rproj$
+^\.Rproj\.user$
+^legacy$
+^docs$
+^README\.Rmd$
+^LICENSE\.md$
